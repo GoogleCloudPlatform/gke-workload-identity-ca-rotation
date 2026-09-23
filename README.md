@@ -69,9 +69,11 @@ root_ca_location   = "us-central1"
 alert_email        = "sre-team@yourcompany.com"
 
 # Map your regional Subordinate pools
+# ca_count (optional, default 1) = the expected number of active intermediate
+# CAs in the pool; the rotator alerts when the pool doesn't match.
 subordinate_pools  = {
-  "us-central1"   = { pool_name = "subordinate-ca-pool-us-central1" }
-  "europe-north1" = { pool_name = "subordinate-ca-pool-europe-north1" }
+  "us-central1"     = { pool_name = "subordinate-ca-pool-us-central1" }
+  "europe-north1"   = { pool_name = "subordinate-ca-pool-europe-north1", ca_count = 2 }
   "asia-southeast1" = { pool_name = "subordinate-ca-pool-asia-southeast1" }
 }
 ```
@@ -148,10 +150,23 @@ gcloud run jobs execute ca-root-rotator-job --region=us-central1
 ```
 
 #### 2. Bootstrap Regional Subordinates
-If the `ca-rotator-job` triggers and finds a pool with zero active CAs:
+If the `ca-rotator-job` triggers and finds a pool with **zero CAs of any kind** (active, staged, or awaiting activation):
 1.  It automatically fetches the baseline configuration (`Config`, `Lifetime`, `KeySpec`) from your central Root CA (via auto-discovery).
-2.  It creates, signs, and enables the very first Subordinate CA in that pool.
+2.  It creates, signs, and enables `ca_count` initial Subordinate CA(s) in that pool (default 1).
 3.  No cleanup tasks are scheduled since there is no old CA to replace.
+
+To bootstrap a new region manually after adding it to Terraform (with the desired `ca_count`):
+```bash
+gcloud run jobs execute ca-rotator-job --region=[NEW_REGION]
+```
+
+#### 3. Expected CA Count (Alerting on Drift)
+`ca_count` is the **expected number of active intermediate CAs** for a pool, used both to bootstrap an empty pool (above) and, on every subsequent run, to detect drift on a pool that already has at least one CA:
+
+- On a mismatch, the job logs an `ALERT: CA count mismatch` line, which the "CA Count Mismatch" Cloud Monitoring policy (a log-match alert in `terraform/monitoring.tf`) turns into an email to `alert_email`. The alert fires again on every run until the drift is fixed.
+- The mismatch never blocks anything: the run still succeeds and rotates the CAs actually present in the pool, whatever their number. Once a pool has been bootstrapped, the rotator never creates or deletes CAs to fix drift — pool resizing from then on is an operator decision (create or remove CAs manually); keep `ca_count` in sync in your `terraform.tfvars` whenever you do.
+
+The rolling rotation replaces each active CA one by one, so a pool with N active CAs keeps N active CAs going forward.
 
 To bootstrap a new region manually after adding it to Terraform:
 ```bash
@@ -253,7 +268,7 @@ The system is configured centrally via Terraform. Update your `terraform.tfvars`
 | `root_ca_subject_cn` | The Common Name (CN) for bootstrapping the Root CA | Required |
 | `root_ca_subject_org` | The Organization (O) for bootstrapping the Root CA | Required |
 | `root_ca_algorithm` | The Key Algorithm for the Root CA | `RSA_PKCS1_4096_SHA256` |
-| `subordinate_pools` | Map of regions to their corresponding Subordinate CA pool names | Required |
+| `subordinate_pools` | Map of regions to their corresponding Subordinate CA pool names. Each pool may optionally set `ca_count` (whole number >= 1, default 1) as the expected number of active intermediate CAs; used to bootstrap an empty pool and to alert on drift afterward | Required |
 | `rotation_schedule` | Cron schedule for the primary automated Subordinate rotation | `0 0 1 */2 *` |
 | `service_account_id` | Name of the IAM Service Account created for the agent | `ca-automation-bot` |
 | `cleanup_delay` | Grace period before deleting old Subordinate CAs | `48h` |
@@ -323,6 +338,18 @@ RUN_INTEGRATION_TESTS=1 go test ./pkg/rotator/... -run TestIntegration_ScheduleR
 RUN_INTEGRATION_TESTS=1 go test ./pkg/sweeper/... -run TestIntegration_CleanupRoot -v -count=1
 ```
 
+### 11. Pool Bootstrap (Empty Pool)
+Test that an entirely empty pool is bootstrapped with `ca_count` initial Subordinate CA(s) in a single run.
+```bash
+RUN_INTEGRATION_TESTS=1 go test ./pkg/rotator/... -run TestIntegration_BootstrapPool -v -count=1
+```
+
+### 12. CA Count Mismatch (Alert, Still Rotates)
+Test that a mismatch between an already-seeded pool's active CA count and `CA_COUNT` does not fail the run — the rotation still succeeds, and the mismatch is only logged as an alert line. Requires the pool to already have at least one active CA.
+```bash
+RUN_INTEGRATION_TESTS=1 go test ./pkg/rotator/... -run TestIntegration_CACountMismatch -v -count=1
+```
+
 ## Verifying mTLS in GKE
 
 To verify that GKE workloads correctly receive certificates and trust the new CA chain after a rotation:
@@ -354,7 +381,7 @@ The automation is split across four distinct Cloud Run jobs. This separation of 
 ### 1. `ca-rotator-job` (Routine Subordinate Rotation)
 *   **Purpose:** Handles the frequent, routine rotation of regional Subordinate CAs (e.g., every 2 months).
 *   **Trigger:** Automatically triggered by Cloud Scheduler.
-*   **Action:** Discovers the oldest active Subordinate CA, creates a new one, signs it with the Root CA, performs a zero-downtime flip (Enable New, Disable Old).
+*   **Action:** Bootstraps `ca_count` initial CAs in an entirely empty pool; otherwise discovers the oldest active Subordinate CA, creates a new one, signs it with the Root CA, performs a zero-downtime flip (Enable New, Disable Old). The pool's active CA count is compared against the configured `ca_count`; a mismatch logs an alert line (picked up by the "CA Count Mismatch" monitoring policy) but the rotation proceeds over the CAs actually present.
 *   **Tasks Created:** Schedules a single task in `ca-cleanup-queue` with `OPERATION=CLEANUP` for T+48 hours to permanently delete the old Subordinate CA.
 
 ### 2. `ca-cleanup-job` (Routine Subordinate Cleanup)

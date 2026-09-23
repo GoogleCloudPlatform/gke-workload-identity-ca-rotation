@@ -221,6 +221,10 @@ resource "google_cloud_run_v2_job" "ca_rotator_job" {
           name  = "POOL_NAME"
           value = each.value.pool_name
         }
+        env {
+          name  = "CA_COUNT"
+          value = tostring(each.value.ca_count)
+        }
 
         env {
           name  = "ROOT_CA_POOL"

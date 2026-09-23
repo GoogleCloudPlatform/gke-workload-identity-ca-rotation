@@ -80,6 +80,15 @@ func TestIntegration_RotateSubordinate(t *testing.T) {
 
 	t.Logf("Running integration test against Project: %s, Pool: %s", cfg.ProjectID, cfg.CAPoolName)
 
+	parentPool := fmt.Sprintf("projects/%s/locations/%s/caPools/%s", cfg.ProjectID, cfg.Location, cfg.CAPoolName)
+	enabledCAs, err := r.listEnabledCAs(ctx, parentPool)
+	if err != nil {
+		t.Fatalf("Failed to list enabled CAs: %v", err)
+	}
+	// Align the expected count with the pool so this test exercises the rotation
+	// logic rather than the CA count validation.
+	r.cfg.CACount = len(enabledCAs)
+
 	err = r.RotateSubordinate(ctx)
 	if err != nil {
 		t.Fatalf("RotateSubordinate failed: %v", err)
@@ -325,14 +334,78 @@ func TestIntegration_BootstrapPool(t *testing.T) {
 	}
 	defer r.Close()
 
-	t.Logf("Running integration test for bootstrapping empty pool: %s", cfg.ProjectID)
+	parentPool := fmt.Sprintf("projects/%s/locations/%s/caPools/%s", cfg.ProjectID, cfg.Location, cfg.CAPoolName)
+
+	t.Logf("Running integration test for bootstrapping empty pool %s with CA_COUNT=%d", cfg.CAPoolName, cfg.CACount)
 
 	err = r.RotateSubordinate(ctx)
 	if err != nil {
 		t.Fatalf("BootstrapPool failed: %v", err)
 	}
 
+	enabledCAs, err := r.listEnabledCAs(ctx, parentPool)
+	if err != nil {
+		t.Fatalf("Failed to list enabled CAs: %v", err)
+	}
+	if len(enabledCAs) != cfg.CACount {
+		t.Errorf("Expected pool to be bootstrapped with %d active CA(s), got %d", cfg.CACount, len(enabledCAs))
+	}
+
 	t.Log("Successfully completed BootstrapPool integration test.")
+}
+
+func TestIntegration_CACountMismatch(t *testing.T) {
+	if os.Getenv("RUN_INTEGRATION_TESTS") == "" {
+		t.Skip("Skipping integration test. Set RUN_INTEGRATION_TESTS=1 to run.")
+	}
+
+	setIntegrationEnv()
+
+	// Disable task scheduling to avoid side-effects during integration testing
+	if os.Getenv("DISABLE_TASK_SCHEDULING") == "" {
+		os.Setenv("DISABLE_TASK_SCHEDULING", "true")
+	}
+
+	ctx := context.Background()
+	cfg, err := config.LoadConfig(ctx)
+	if err != nil {
+		t.Fatalf("Failed to load configuration: %v", err)
+	}
+
+	r, err := NewRotator(ctx, cfg)
+	if err != nil {
+		t.Fatalf("Failed to create Rotator: %v", err)
+	}
+	defer r.Close()
+
+	parentPool := fmt.Sprintf("projects/%s/locations/%s/caPools/%s", cfg.ProjectID, cfg.Location, cfg.CAPoolName)
+
+	enabledCAs, err := r.listEnabledCAs(ctx, parentPool)
+	if err != nil {
+		t.Fatalf("Failed to list enabled CAs: %v", err)
+	}
+	// This test exercises the alert-only mismatch path, which only applies to a
+	// pool that already has at least one CA; a completely empty pool is bootstrapped
+	// instead (see TestIntegration_BootstrapPool).
+	if len(enabledCAs) == 0 {
+		t.Fatalf("Pool %s has no active CAs; run this test against a pool that already has at least one active CA", cfg.CAPoolName)
+	}
+
+	// Deliberately configure an expected count that does NOT match the pool.
+	r.cfg.CACount = len(enabledCAs) + 1
+
+	t.Logf("Running integration test with expected CA_COUNT=%d against a pool with %d active CA(s)",
+		r.cfg.CACount, len(enabledCAs))
+
+	// A mismatch must not fail the run: the job still succeeds and rotates the
+	// CAs actually present in the pool, while logging a stable alert line for
+	// the log-match alert policy in terraform/monitoring.tf.
+	err = r.RotateSubordinate(ctx)
+	if err != nil {
+		t.Fatalf("RotateSubordinate failed despite CA count mismatch (expected success): %v", err)
+	}
+
+	t.Log("RotateSubordinate succeeded on CA count mismatch, as expected.")
 }
 
 func TestIntegration_BootstrapRootPool(t *testing.T) {
@@ -341,7 +414,7 @@ func TestIntegration_BootstrapRootPool(t *testing.T) {
 	}
 
 	setIntegrationEnv()
-	
+
 	// Override specific root CA settings for bootstrapping
 	os.Setenv("ROOT_CA_POOL", "root-bootstrap-test-pool")
 	os.Setenv("ROOT_CA_SUBJECT_CN", "Test Automation Root")
@@ -369,4 +442,3 @@ func TestIntegration_BootstrapRootPool(t *testing.T) {
 
 	t.Log("Successfully completed BootstrapRootPool integration test.")
 }
-

@@ -65,6 +65,11 @@ func (r *Rotator) Close() error {
 
 // RotateSubordinate orchestrates the zero-downtime rolling rotation of a Subordinate CA Pool.
 // It iterates through all currently active CAs and sequentially replaces them one by one.
+// An entirely empty pool is bootstrapped with CACount initial CAs. For a pool that already
+// has at least one CA, the active count is compared against CACount; a mismatch logs an
+// alert line (picked up by the log-match alert policy in terraform/monitoring.tf) but does
+// not block the rotation, which operates on the CAs actually present in the pool - the
+// rotator never creates or deletes CAs to fix drift on an already-seeded pool.
 func (r *Rotator) RotateSubordinate(ctx context.Context) error {
 	log.Printf("Starting Subordinate CA Rotation for pool: %s in %s", r.cfg.CAPoolName, r.cfg.Location)
 
@@ -140,64 +145,6 @@ func (r *Rotator) RotateSubordinate(ctx context.Context) error {
 		}
 	}
 
-	if len(activeCAs) == 0 && stagedCA == nil && awaitingCA == nil {
-		log.Printf("No active CAs found in pool %s. Bootstrapping initial Subordinate CA...", r.cfg.CAPoolName)
-		
-		// Fetch Root CA to clone its baseline configuration
-		rootPath := fmt.Sprintf("projects/%s/locations/%s/caPools/%s/certificateAuthorities/%s",
-			r.cfg.ProjectID, r.cfg.RootCALocation, r.cfg.RootCAPool, r.cfg.RootCAName)
-		rootCA, err := r.caClient.GetCertificateAuthority(ctx, &privatecapb.GetCertificateAuthorityRequest{
-			Name: rootPath,
-		})
-		if err != nil {
-			return fmt.Errorf("failed to fetch Root CA for bootstrapping: %v", err)
-		}
-
-		caID := fmt.Sprintf("sub-ca-%d", time.Now().UnixNano()/int64(time.Millisecond))
-		newCAName := fmt.Sprintf("%s/certificateAuthorities/%s", parentPool, caID)
-
-		createReq := &privatecapb.CreateCertificateAuthorityRequest{
-			Parent:                 parentPool,
-			CertificateAuthorityId: caID,
-			CertificateAuthority: &privatecapb.CertificateAuthority{
-				Type:     privatecapb.CertificateAuthority_SUBORDINATE,
-				Config:   rootCA.Config,
-				Lifetime: rootCA.Lifetime,
-				KeySpec:  rootCA.KeySpec,
-			},
-		}
-
-		log.Printf("Creating initial Subordinate CA: %s", newCAName)
-		opCreate, err := r.caClient.CreateCertificateAuthority(ctx, createReq)
-		if err != nil {
-			return fmt.Errorf("failed to bootstrap CA: %v", err)
-		}
-		_, err = opCreate.Wait(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to wait for bootstrap CA creation: %v", err)
-		}
-
-		newCA, err := r.activateSubordinate(ctx, newCAName)
-		if err != nil {
-			return err
-		}
-
-		log.Printf("Enabling initial CA: %s", newCA.Name)
-		opEnable, err := r.caClient.EnableCertificateAuthority(ctx, &privatecapb.EnableCertificateAuthorityRequest{
-			Name: newCA.Name,
-		})
-		if err != nil {
-			return fmt.Errorf("failed to enable initial CA: %v", err)
-		}
-		_, err = opEnable.Wait(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to wait for initial CA enablement: %v", err)
-		}
-
-		log.Printf("Successfully bootstrapped pool %s", r.cfg.CAPoolName)
-		return nil
-	}
-
 	// --- Step 2: Idempotency Check & Self-Healing ---
 
 	// Heal Stranded DISABLED CAs:
@@ -237,6 +184,51 @@ func (r *Rotator) RotateSubordinate(ctx context.Context) error {
 				}
 			}
 		}
+	}
+
+	// --- Step 3: Bootstrap an empty pool, or compare the pool size against the
+	// expected CA count ---
+	// The ca_pool module creates Subordinate CA pools empty, so a pool with zero
+	// CAs of any kind (active, staged, or awaiting activation) is bootstrapped here
+	// with CACount initial CAs, cloning the baseline configuration (Config, Lifetime,
+	// KeySpec) from the project's Root CA.
+	//
+	// For a pool that already has at least one CA, the rotator never creates or
+	// deletes CAs to fix drift - changing the pool size is an operator decision.
+	// A mismatch there only logs a stable "ALERT: CA count mismatch" line, which the
+	// log-match alert policy in terraform/monitoring.tf turns into an incident
+	// notification. The rolling rotation below proceeds over the CAs actually
+	// present in the pool either way.
+	if len(activeCAs) == 0 && stagedCA == nil && awaitingCA == nil {
+		log.Printf("No CAs found in pool %s. Bootstrapping %d initial Subordinate CA(s)...",
+			r.cfg.CAPoolName, r.cfg.CACount)
+
+		rootPath := fmt.Sprintf("projects/%s/locations/%s/caPools/%s/certificateAuthorities/%s",
+			r.cfg.ProjectID, r.cfg.RootCALocation, r.cfg.RootCAPool, r.cfg.RootCAName)
+		rootCA, err := r.caClient.GetCertificateAuthority(ctx, &privatecapb.GetCertificateAuthorityRequest{
+			Name: rootPath,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to fetch Root CA for bootstrapping: %v", err)
+		}
+
+		for i := 1; i <= r.cfg.CACount; i++ {
+			if err := r.bootstrapSubordinate(ctx, parentPool, rootCA, i); err != nil {
+				return fmt.Errorf("failed to bootstrap Subordinate CA %d/%d: %v", i, r.cfg.CACount, err)
+			}
+		}
+
+		log.Printf("Successfully bootstrapped pool %s with %d Subordinate CA(s)", r.cfg.CAPoolName, r.cfg.CACount)
+		return nil
+	}
+
+	enabledCAs, err := r.listEnabledCAs(ctx, parentPool)
+	if err != nil {
+		return err
+	}
+	if len(enabledCAs) != r.cfg.CACount {
+		log.Printf("ALERT: CA count mismatch for pool %s: found %d active CA(s), but CA_COUNT is configured as %d - reconcile the pool manually or update ca_count in terraform",
+			r.cfg.CAPoolName, len(enabledCAs), r.cfg.CACount)
 	}
 
 	// Filter out any active CAs that were already rotated in this cycle.
@@ -302,6 +294,82 @@ func (r *Rotator) RotateSubordinate(ctx context.Context) error {
 	}
 
 	log.Printf("Successfully completed rolling rotation for pool %s", r.cfg.CAPoolName)
+	return nil
+}
+
+// listEnabledCAs lists the currently enabled Subordinate CAs in a pool, oldest first.
+func (r *Rotator) listEnabledCAs(ctx context.Context, parentPool string) ([]*privatecapb.CertificateAuthority, error) {
+	it := r.caClient.ListCertificateAuthorities(ctx, &privatecapb.ListCertificateAuthoritiesRequest{
+		Parent: parentPool,
+	})
+
+	var enabledCAs []*privatecapb.CertificateAuthority
+	for {
+		ca, err := it.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to list CAs: %v", err)
+		}
+		if ca.State == privatecapb.CertificateAuthority_ENABLED {
+			enabledCAs = append(enabledCAs, ca)
+		}
+	}
+
+	sort.Slice(enabledCAs, func(i, j int) bool {
+		return enabledCAs[i].CreateTime.AsTime().Before(enabledCAs[j].CreateTime.AsTime())
+	})
+	return enabledCAs, nil
+}
+
+// bootstrapSubordinate creates, activates, and enables a single initial Subordinate CA
+// in an otherwise empty pool, cloning its baseline configuration (Config, Lifetime, KeySpec)
+// from the project's Root CA.
+func (r *Rotator) bootstrapSubordinate(ctx context.Context, parentPool string, rootCA *privatecapb.CertificateAuthority, index int) error {
+	// Suffix the bootstrap index to guarantee unique CA IDs even if two CAs are
+	// created within the same millisecond.
+	caID := fmt.Sprintf("sub-ca-%d-%d", time.Now().UnixNano()/int64(time.Millisecond), index)
+	newCAName := fmt.Sprintf("%s/certificateAuthorities/%s", parentPool, caID)
+
+	createReq := &privatecapb.CreateCertificateAuthorityRequest{
+		Parent:                 parentPool,
+		CertificateAuthorityId: caID,
+		CertificateAuthority: &privatecapb.CertificateAuthority{
+			Type:     privatecapb.CertificateAuthority_SUBORDINATE,
+			Config:   rootCA.Config,
+			Lifetime: rootCA.Lifetime,
+			KeySpec:  rootCA.KeySpec,
+		},
+	}
+
+	log.Printf("Creating initial Subordinate CA: %s", newCAName)
+	opCreate, err := r.caClient.CreateCertificateAuthority(ctx, createReq)
+	if err != nil {
+		return fmt.Errorf("failed to create CA: %v", err)
+	}
+	_, err = opCreate.Wait(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to wait for CA creation: %v", err)
+	}
+
+	newCA, err := r.activateSubordinate(ctx, newCAName)
+	if err != nil {
+		return err
+	}
+
+	log.Printf("Enabling initial CA: %s", newCA.Name)
+	opEnable, err := r.caClient.EnableCertificateAuthority(ctx, &privatecapb.EnableCertificateAuthorityRequest{
+		Name: newCA.Name,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to enable initial CA: %v", err)
+	}
+	_, err = opEnable.Wait(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to wait for initial CA enablement: %v", err)
+	}
+
 	return nil
 }
 

@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 	"time"
 
 	"golang.org/x/oauth2/google"
@@ -45,7 +46,14 @@ type Config struct {
 	DisableTaskScheduling bool
 	// ServiceAccountEmail is used by Cloud Tasks to generate an OIDC token
 	// that has permission to trigger the Cloud Run Cleanup Job.
-	ServiceAccountEmail   string
+	ServiceAccountEmail string
+
+	// CACount is the expected number of active Subordinate CAs per pool. An
+	// entirely empty pool is bootstrapped with this many CAs. For a pool that
+	// already has at least one CA, the rotator compares the active count against
+	// this value on every run and logs an alert on mismatch instead of creating
+	// or deleting CAs.
+	CACount int
 }
 
 func LoadConfig(ctx context.Context) (*Config, error) {
@@ -65,10 +73,26 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 	if location == "" {
 		return nil, fmt.Errorf("LOCATION environment variable is required")
 	}
-	
+
 	poolName := os.Getenv("POOL_NAME")
 	if poolName == "" {
 		return nil, fmt.Errorf("POOL_NAME environment variable is required")
+	}
+
+	// CA_COUNT defines the expected number of active Subordinate CAs per pool.
+	// An empty pool is bootstrapped with this many CAs; a non-empty pool is
+	// compared against it on every run and logs an alert on mismatch. Defaults
+	// to 1.
+	caCount := 1
+	if countStr := os.Getenv("CA_COUNT"); countStr != "" {
+		count, err := strconv.Atoi(countStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid CA_COUNT %q: %v", countStr, err)
+		}
+		if count < 1 {
+			return nil, fmt.Errorf("CA_COUNT must be >= 1, got %d", count)
+		}
+		caCount = count
 	}
 
 	rootCAPool := os.Getenv("ROOT_CA_POOL")
@@ -173,5 +197,6 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 		QueueLocation:         queueLocation,
 		DisableTaskScheduling: disableTaskScheduling,
 		ServiceAccountEmail:   serviceAccountEmail,
+		CACount:               caCount,
 	}, nil
 }

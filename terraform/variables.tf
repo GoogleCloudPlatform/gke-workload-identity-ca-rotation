@@ -24,14 +24,23 @@ variable "region" {
 }
 
 variable "subordinate_pools" {
-  description = "Map of regions to their corresponding manually created Subordinate CA pools"
+  description = "Map of regions to their corresponding manually created Subordinate CA pools. Each pool may optionally set ca_count (default 1) as the expected number of active intermediate CAs; the rotator logs an alert when the pool doesn't match."
   type = map(object({
     pool_name = string
+    ca_count  = optional(number, 1)
   }))
   default = {
     "us-central1" = {
       pool_name = "subordinate-ca-pool-us-central1"
     }
+  }
+
+  validation {
+    condition = alltrue([
+      for _, pool in var.subordinate_pools :
+      pool.ca_count >= 1 && floor(pool.ca_count) == pool.ca_count
+    ])
+    error_message = "The ca_count of every subordinate pool must be a whole number >= 1."
   }
 }
 

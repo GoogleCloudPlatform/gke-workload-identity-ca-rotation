@@ -51,4 +51,27 @@ resource "google_monitoring_alert_policy" "job_failure_alert" {
   }
 }
 
+# The rotator logs a stable "ALERT: CA count mismatch" line whenever a Subordinate
+# CA pool's number of active CAs doesn't match the configured ca_count (CA_COUNT env
+# var on the ca-rotator-job). The mismatch never blocks the rotation, which operates
+# on the CAs actually present in the pool; this policy turns that log line into an
+# incident notification so the drift gets reconciled.
+resource "google_monitoring_alert_policy" "ca_count_mismatch_alert" {
+  display_name = "CA Count Mismatch"
+  combiner     = "OR"
+  notification_channels = [google_monitoring_notification_channel.email_alert.name]
+
+  conditions {
+    display_name = "Subordinate pool active CA count differs from configured CA_COUNT"
+    condition_matched_log {
+      filter = "resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"ca-rotator-job\" AND textPayload=~\"^ALERT: CA count mismatch\""
+    }
+  }
+
+  documentation {
+    content   = "A Subordinate CA pool's active CA count doesn't match the configured ca_count. The rotation still ran over the CAs actually present. Reconcile by creating or removing CAs, or by updating ca_count in terraform.tfvars. Check Cloud Logging for the 'ALERT: CA count mismatch' line to see the pool, actual, and expected counts."
+    mime_type = "text/markdown"
+  }
+}
+
 
